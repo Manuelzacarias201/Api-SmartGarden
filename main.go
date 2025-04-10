@@ -10,138 +10,117 @@ import (
 	"time"
 
 	"ApiSmart/config"
-	eventHandlers "ApiSmart/internal/adapters/event"
-	"ApiSmart/internal/adapters/handlers"
-	"ApiSmart/internal/adapters/repositories/mysql"
-	"ApiSmart/internal/core/services"
-	"ApiSmart/pkg/database"
-	"ApiSmart/pkg/event"
-	"github.com/gin-contrib/cors"
-	"github.com/gin-gonic/gin"
+	"ApiSmart/src/core/application/service"
+	"ApiSmart/src/core/application/use_case"
+	eventAdapter "ApiSmart/src/infrastructure/adapters/events"
+	httpAdapter "ApiSmart/src/infrastructure/adapters/http"
+	"ApiSmart/src/infrastructure/adapters/http/handlers"
+	"ApiSmart/src/infrastructure/adapters/repositories/mysql"
+	"ApiSmart/src/infrastructure/auth"
+	"ApiSmart/src/infrastructure/database"
 )
 
 func main() {
+	// Cargar configuración
 	cfg := config.LoadConfig()
 
-	// Conexión a base de datos
-	db, err := database.NewMySQLConnection(cfg.DBConfig)
+	// Inicializar conexión a base de datos
+	dbConn, err := database.NewMySQLConnection(cfg.Database)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		log.Fatalf("Error conectando a la base de datos: %v", err)
 	}
-	defer db.Close()
+	defer dbConn.Close()
 
-	// Inicializar sistema de eventos (RabbitMQ)
-	eventDispatcher, broker, err := event.InitEventSystem(cfg.RabbitMQConfig)
-	if err != nil {
-		log.Printf("Warning: Event system initialization failed: %v", err)
-		log.Println("Continuing without event system...")
-	} else {
-		defer broker.Close()
-	}
+	db := dbConn.GetDB()
+
+	// Inicializar servicio JWT
+	jwtService := auth.NewJWTService(cfg.JWT.Secret, cfg.JWT.ExpiryHours)
 
 	// Inicializar repositorios
 	userRepo := mysql.NewUserRepository(db)
 	sensorRepo := mysql.NewSensorRepository(db)
 
 	// Inicializar servicios
-	alertService := services.NewAlertService()
+	alertService := service.NewAlertService()
 
-	var authService services.AuthService
-	var sensorService services.SensorService
+	// Intentar inicializar el sistema de eventos
+	var eventDispatcher *eventAdapter.EventDispatcherAdapter
+	var rabbitMQAdapter *eventAdapter.RabbitMQAdapter
 
-	// Utilizar servicios basados en eventos si el sistema de eventos está disponible
-	if eventDispatcher != nil {
-		authService = services.NewEventDrivenAuthService(userRepo, eventDispatcher)
-		sensorService = services.NewEventDrivenSensorService(sensorRepo, alertService, eventDispatcher)
-
-		// Inicializar handlers de eventos
-		sensorDataHandler := eventHandlers.NewSensorDataHandler(sensorService)
-		alertHandler := eventHandlers.NewAlertHandler(sensorService)
-		userEventHandler := eventHandlers.NewUserEventHandler(authService)
-
-		// Configurar consumidores de eventos
-		eventConsumerHandlers := map[string]map[string]event.EventHandler{
-			event.TopicSensorData: {
-				event.EventTypeSensorDataCreated: sensorDataHandler,
-			},
-			event.TopicSensorAlerts: {
-				event.EventTypeSensorThresholdAlert: alertHandler,
-			},
-			event.TopicUserEvents: {
-				event.EventTypeUserRegistered:    userEventHandler,
-				event.EventTypeUserAuthenticated: userEventHandler,
-			},
-		}
-
-		if err := event.InitConsumers(broker, eventConsumerHandlers); err != nil {
-			log.Printf("Warning: Failed to initialize event consumers: %v", err)
-		}
+	rabbitMQAdapter, err = eventAdapter.NewRabbitMQAdapter(cfg.RabbitMQ)
+	if err != nil {
+		log.Printf("Advertencia: Error inicializando RabbitMQ: %v", err)
+		log.Println("Continuando sin sistema de eventos...")
 	} else {
-		// Fallback a servicios tradicionales si el sistema de eventos no está disponible
-		authService = services.NewAuthService(userRepo)
-		sensorService = services.NewSensorService(sensorRepo, alertService)
+		defer rabbitMQAdapter.Close()
+		eventDispatcher = eventAdapter.NewEventDispatcherAdapter(rabbitMQAdapter)
+		log.Println("Sistema de eventos inicializado correctamente")
 	}
 
+	// Inicializar casos de uso
+	authUseCase := use_case.NewAuthUseCase(userRepo, eventDispatcher, jwtService)
+	sensorUseCase := use_case.NewSensorUseCase(sensorRepo, alertService, eventDispatcher)
+
 	// Inicializar handlers HTTP
-	authHandler := handlers.NewAuthHandler(authService)
-	sensorHandler := handlers.NewSensorHandler(sensorService)
+	authHandler := handlers.NewAuthHandler(authUseCase)
+	sensorHandler := handlers.NewSensorHandler(sensorUseCase)
 
-	// Configurar router
-	router := gin.Default()
+	// Configurar router HTTP
+	router := httpAdapter.NewRouter(
+		authHandler,
+		sensorHandler,
+		httpAdapter.RouterConfig{
+			AllowedOrigins: []string{"http://localhost:3000", "http://127.0.0.1:8000"},
+		},
+	)
 
-	// Configurar middleware CORS
-	router.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:3000", "http://127.0.0.1:8000"},
-		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Requested-With"},
-		ExposeHeaders:    []string{"Content-Length"},
-		AllowCredentials: true,
-		MaxAge:           12 * time.Hour,
-	}))
+	// Si el sistema de eventos está disponible, configurar consumidores
+	if rabbitMQAdapter != nil {
+		// Crear manejadores de eventos
+		sensorDataHandler := eventAdapter.NewSensorDataHandler(sensorUseCase)
+		alertHandler := eventAdapter.NewAlertHandler(sensorUseCase)
+		userEventHandler := eventAdapter.NewUserEventHandler(authUseCase)
 
-	// Rutas de autenticación
-	router.POST("/api/register", authHandler.Register)
-	router.POST("/api/login", authHandler.Login)
+		// Suscribir manejadores a topics
+		if err := rabbitMQAdapter.Subscribe("sensor.data", sensorDataHandler); err != nil {
+			log.Printf("Error suscribiendo al topic sensor.data: %v", err)
+		}
 
-	// Ruta para enviar datos de sensores (sin autenticación para facilitar la integración con dispositivos IoT)
-	router.POST("/sensores", sensorHandler.CreateSensorData)
+		if err := rabbitMQAdapter.Subscribe("sensor.alerts", alertHandler); err != nil {
+			log.Printf("Error suscribiendo al topic sensor.alerts: %v", err)
+		}
 
-	// Rutas que requieren autenticación
-	authorized := router.Group("/api")
-	{
-		authorized.GET("/sensors", sensorHandler.GetAllSensorData)
-		authorized.GET("/sensors/latest", sensorHandler.GetLatestSensorData)
-		authorized.GET("/sensors/alerts", sensorHandler.GetAlerts)
-		authorized.PUT("/sensors/alerts/:id/read", sensorHandler.MarkAlertAsRead)
+		if err := rabbitMQAdapter.Subscribe("user.events", userEventHandler); err != nil {
+			log.Printf("Error suscribiendo al topic user.events: %v", err)
+		}
 	}
 
 	// Configurar servidor HTTP
 	srv := &http.Server{
 		Addr:    ":" + cfg.ServerPort,
-		Handler: router,
+		Handler: router.Setup(),
 	}
 
 	// Iniciar servidor en una goroutine
 	go func() {
+		log.Printf("Servidor iniciado en el puerto %s", cfg.ServerPort)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Failed to start server: %v", err)
+			log.Fatalf("Error iniciando servidor: %v", err)
 		}
 	}()
-
-	log.Printf("Server started on port %s", cfg.ServerPort)
-	log.Printf("Event system initialized: %v", eventDispatcher != nil)
 
 	// Configurar graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	log.Println("Shutting down server...")
 
+	log.Println("Apagando servidor...")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatalf("Server forced to shutdown: %v", err)
+		log.Fatalf("Forzando cierre del servidor: %v", err)
 	}
 
-	log.Println("Server exited properly")
+	log.Println("Servidor cerrado correctamente")
 }
